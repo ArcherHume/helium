@@ -1,0 +1,825 @@
+--- a/chrome/browser/ui/helium/helium_layout_state_controller.h
++++ b/chrome/browser/ui/helium/helium_layout_state_controller.h
+@@ -18,7 +18,8 @@
+   kCompact = 1,
+   kVertical = 2,
+   kDynamic = 3,
+-  kMaxValue = kDynamic,
++  kVerticalOverlay = 4,
++  kMaxValue = kVerticalOverlay,
+ };
+ 
+ class HeliumLayoutStateController {
+@@ -39,6 +40,10 @@
+   bool IsCompactLayout() const;
+   bool IsVerticalLayout() const;
+   bool IsDynamicLayout() const;
++  bool IsVerticalOverlayLayout() const;
++  // True for both kVertical and kVerticalOverlay (i.e. any layout that
++  // displays the vertical tab strip, floating or docked).
++  bool IsAnyVerticalLayout() const;
+   bool IsZenModeEnabled() const;
+ 
+   void SetBrowserLayout(HeliumLayoutType layout);
+--- a/chrome/browser/ui/helium/helium_layout_state_controller.cc
++++ b/chrome/browser/ui/helium/helium_layout_state_controller.cc
+@@ -50,6 +50,16 @@
+   return GetBrowserLayout() == HeliumLayoutType::kDynamic;
+ }
+ 
++bool HeliumLayoutStateController::IsVerticalOverlayLayout() const {
++  return GetBrowserLayout() == HeliumLayoutType::kVerticalOverlay;
++}
++
++bool HeliumLayoutStateController::IsAnyVerticalLayout() const {
++  const HeliumLayoutType layout = GetBrowserLayout();
++  return layout == HeliumLayoutType::kVertical ||
++         layout == HeliumLayoutType::kVerticalOverlay;
++}
++
+ bool HeliumLayoutStateController::IsZenModeEnabled() const {
+   return features::IsHeliumZenModeFeatureEnabled() &&
+          pref_service_->GetBoolean(prefs::kHeliumZenMode);
+@@ -63,7 +73,9 @@
+   int layout_value = pref_service_->GetInteger(prefs::kHeliumLayout);
+ 
+   if (!tabs::IsVerticalTabsFeatureEnabled() &&
+-      layout_value == std::to_underlying(HeliumLayoutType::kVertical)) {
++      (layout_value == std::to_underlying(HeliumLayoutType::kVertical) ||
++       layout_value ==
++           std::to_underlying(HeliumLayoutType::kVerticalOverlay))) {
+     return HeliumLayoutType::kClassic;
+   }
+ 
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
+@@ -63,6 +63,10 @@
+   bool IsTabStripRightAligned() const;
+   void SetTabStripRightAligned(bool right_aligned);
+ 
++  // True when the active layout is the Arc-style floating overlay variant of
++  // vertical tabs (helium.browser.layout == kVerticalOverlay).
++  bool IsOverlayMode() const;
++
+   std::unique_ptr<ScopedEnableStateLock> GetEnableStateLock();
+ 
+   bool IsCollapsed() const;
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
+@@ -27,6 +27,15 @@
+ 
+ namespace tabs {
+ 
++namespace {
++
++bool IsVerticalLayoutPrefValue(int layout_value) {
++  return layout_value == std::to_underlying(HeliumLayoutType::kVertical) ||
++         layout_value == std::to_underlying(HeliumLayoutType::kVerticalOverlay);
++}
++
++}  // namespace
++
+ DEFINE_USER_DATA(VerticalTabStripStateController);
+ 
+ VerticalTabStripStateController::VerticalTabStripStateController(
+@@ -53,8 +62,7 @@
+   state_.uncollapsed_width =
+       pref_service_->GetInteger(prefs::kHeliumVerticalUncollapsedWidth);
+   is_vertical_tabs_enabled_ =
+-      pref_service_->GetInteger(prefs::kHeliumLayout) ==
+-      std::to_underlying(HeliumLayoutType::kVertical);
++      IsVerticalLayoutPrefValue(pref_service_->GetInteger(prefs::kHeliumLayout));
+ 
+   UpdateCollapseActionItem();
+ }
+@@ -116,6 +124,11 @@
+   pref_service_->SetBoolean(prefs::kHeliumVerticalRightAligned, right_aligned);
+ }
+ 
++bool VerticalTabStripStateController::IsOverlayMode() const {
++  return pref_service_->GetInteger(prefs::kHeliumLayout) ==
++         std::to_underlying(HeliumLayoutType::kVerticalOverlay);
++}
++
+ bool VerticalTabStripStateController::IsCollapsed() const {
+   return state_.collapsed;
+ }
+@@ -193,8 +206,7 @@
+   }
+ 
+   is_vertical_tabs_enabled_ =
+-      pref_service_->GetInteger(prefs::kHeliumLayout) ==
+-      std::to_underlying(HeliumLayoutType::kVertical);
++      IsVerticalLayoutPrefValue(pref_service_->GetInteger(prefs::kHeliumLayout));
+ 
+   NotifyModeChanged();
+ }
+@@ -209,9 +221,8 @@
+ 
+   if (enable_state_lock_count_ == 0 && mode_changed_while_locked_) {
+     mode_changed_while_locked_ = false;
+-    is_vertical_tabs_enabled_ =
+-        pref_service_->GetInteger(prefs::kHeliumLayout) ==
+-        std::to_underlying(HeliumLayoutType::kVertical);
++    is_vertical_tabs_enabled_ = IsVerticalLayoutPrefValue(
++        pref_service_->GetInteger(prefs::kHeliumLayout));
+     NotifyModeChanged();
+   }
+ }
+--- a/chrome/browser/ui/tabs/tab_metrics_provider.cc
++++ b/chrome/browser/ui/tabs/tab_metrics_provider.cc
+@@ -37,10 +37,12 @@
+ 
+   size_t vertical_tab_profiles = 0;
+   for (Profile* profile : profiles) {
+-    if (profile->GetPrefs() &&
+-        profile->GetPrefs()->GetInteger(prefs::kHeliumLayout) ==
+-            std::to_underlying(HeliumLayoutType::kVertical)) {
+-      vertical_tab_profiles++;
++    if (profile->GetPrefs()) {
++      const int layout = profile->GetPrefs()->GetInteger(prefs::kHeliumLayout);
++      if (layout == std::to_underlying(HeliumLayoutType::kVertical) ||
++          layout == std::to_underlying(HeliumLayoutType::kVerticalOverlay)) {
++        vertical_tab_profiles++;
++      }
+     }
+   }
+ 
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -100,6 +100,7 @@
+ class TopContainerView;
+ class TopControlsSlideController;
+ class TopControlsSlideControllerTest;
++class VerticalOverlayHoverZone;
+ class VerticalTabStripRegionView;
+ class WebAppFrameToolbarView;
+ class WebUITabStripContainerView;
+@@ -974,6 +975,12 @@
+   void OnVerticalTabStripModeChanged(
+       tabs::VerticalTabStripStateController* controller);
+ 
++  // Reconfigures the vertical tab strip + hover-zone for the current layout
++  // (in particular: transitions between Vertical and Vertical Overlay
++  // variants). Safe to call on every mode/alignment change.
++  void UpdateVerticalOverlayMode();
++  void OnVerticalOverlayHoverVisibilityChanged(bool visible);
++
+   void OnToolbarTabStripStateChanged(HeliumLayoutStateController* controller);
+ 
+   void OnProjectsPanelStateChanged(ProjectsPanelStateController* controller);
+@@ -1352,6 +1359,10 @@
+   // The view responsible for housing the contents of the vertical tab strip.
+   raw_ptr<VerticalTabStripRegionView> vertical_tab_strip_region_view_ = nullptr;
+ 
++  // Transparent hover hot-zone along the leading (or trailing) edge used by
++  // the Vertical Overlay layout to reveal the floating tab strip.
++  raw_ptr<VerticalOverlayHoverZone> vertical_overlay_hover_zone_ = nullptr;
++
+   // The view responsible for housing the contents of the projects panel.
+   raw_ptr<ProjectsPanelView> projects_panel_container_ = nullptr;
+ 
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -163,6 +163,7 @@
+ #include "chrome/browser/ui/views/frame/top_container_loading_bar.h"
+ #include "chrome/browser/ui/views/frame/top_container_view.h"
+ #include "chrome/browser/ui/views/frame/top_controls_slide_controller.h"
++#include "chrome/browser/ui/views/frame/vertical_overlay_hover_zone.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/web_contents_close_handler.h"
+ #include "chrome/browser/ui/views/fullscreen_control/fullscreen_control_host.h"
+@@ -1107,6 +1108,13 @@
+ 
+     vertical_tab_strip_region_view_ =
+         AddChildView(std::move(vertical_tab_strip_container));
++
++    vertical_overlay_hover_zone_ =
++        AddChildView(std::make_unique<VerticalOverlayHoverZone>(
++            base::BindRepeating(
++                &BrowserView::OnVerticalOverlayHoverVisibilityChanged,
++                base::Unretained(this))));
++    vertical_overlay_hover_zone_->SetVisible(false);
+   } else {
+     horizontal_tab_strip_region_view_->InitializeTabStrip();
+   }
+@@ -1161,6 +1169,9 @@
+         vertical_tab_strip_state_controller->RegisterOnModeChanged(
+             base::BindRepeating(&BrowserView::OnVerticalTabStripModeChanged,
+                                 base::Unretained(this)));
++
++    // Sync overlay state with the initial layout.
++    UpdateVerticalOverlayMode();
+   }
+ 
+   GetViewAccessibility().SetRole(ax::mojom::Role::kClient);
+@@ -1224,6 +1235,7 @@
+   window_scrim_view_ = nullptr;
+   contents_container_ = nullptr;
+   vertical_tab_strip_region_view_ = nullptr;
++  vertical_overlay_hover_zone_ = nullptr;
+   projects_panel_container_ = nullptr;
+   toolbar_height_side_panel_ = nullptr;
+   contents_height_side_panel_ = nullptr;
+@@ -1677,6 +1689,10 @@
+   const bool should_be_vertical = controller->ShouldDisplayVerticalTabs();
+   if (vertical_initialized == should_be_vertical) {
+     // Mode is unchanged; just re-layout so alignment-dependent views update.
++    // We still need to refresh overlay mode in case the user toggled between
++    // the Vertical and Vertical Overlay layout variants (both report as
++    // "vertical" from this controller's perspective).
++    UpdateVerticalOverlayMode();
+     UpdateZenCollapseButtonVisibility();
+     InvalidateLayout();
+     return;
+@@ -1692,10 +1708,62 @@
+ 
+   GetFrameView()->OnTabStripStateChanged();
+ 
++  UpdateVerticalOverlayMode();
+   UpdateTabSearchBubbleHost();
+   InvalidateLayout();
+ }
+ 
++void BrowserView::UpdateVerticalOverlayMode() {
++  if (!vertical_tab_strip_region_view_) {
++    return;
++  }
++  auto* controller = tabs::VerticalTabStripStateController::From(browser_);
++  const bool overlay_mode =
++      controller && controller->ShouldDisplayVerticalTabs() &&
++      controller->IsOverlayMode();
++
++  vertical_tab_strip_region_view_->SetOverlayMode(overlay_mode);
++
++  if (vertical_overlay_hover_zone_) {
++    vertical_overlay_hover_zone_->SetVisible(overlay_mode);
++  }
++
++  if (overlay_mode) {
++    // Reorder the vertical tab strip to the top of the Z-order so it paints
++    // above the web contents, top container, etc.
++    ReorderChildView(vertical_tab_strip_region_view_, children().size());
++    if (vertical_overlay_hover_zone_) {
++      // The hover zone should receive pointer input but paint below the
++      // overlay; keep it just below the strip.
++      ReorderChildView(vertical_overlay_hover_zone_, children().size() - 1);
++
++      // Forward pointer enter/exit on the strip itself to the hover zone so
++      // that moving the mouse into the overlay card doesn't dismiss it. The
++      // hover zone and the strip are both owned by this BrowserView, so the
++      // raw pointer is safe for the lifetime of this callback (which is
++      // cleared when overlay mode is turned off or either view is destroyed).
++      vertical_tab_strip_region_view_->SetOverlayPointerCallback(
++          base::BindRepeating(
++              [](VerticalOverlayHoverZone* hz, bool entered) {
++                if (entered) {
++                  hz->OnOverlayPointerEntered();
++                } else {
++                  hz->OnOverlayPointerExited();
++                }
++              },
++              base::Unretained(vertical_overlay_hover_zone_.get())));
++    }
++  } else if (vertical_tab_strip_region_view_) {
++    vertical_tab_strip_region_view_->SetOverlayPointerCallback({});
++  }
++}
++
++void BrowserView::OnVerticalOverlayHoverVisibilityChanged(bool visible) {
++  if (vertical_tab_strip_region_view_) {
++    vertical_tab_strip_region_view_->SetOverlayVisible(visible);
++  }
++}
++
+ void BrowserView::OnToolbarTabStripStateChanged(
+     HeliumLayoutStateController* controller) {
+   if (!horizontal_tab_strip_region_view_) {
+@@ -5666,6 +5734,7 @@
+   layout_views.horizontal_tab_strip_region_view =
+       horizontal_tab_strip_region_view_;
+   layout_views.vertical_tab_strip_region_view = vertical_tab_strip_region_view_;
++  layout_views.vertical_overlay_hover_zone = vertical_overlay_hover_zone_;
+   layout_views.projects_panel_container = projects_panel_container_;
+   layout_views.toolbar = toolbar_;
+   layout_views.infobar_container = infobar_container_;
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -100,6 +100,8 @@
+   // views::View:
+   void AddedToWidget() override;
+   void Layout(PassKey) override;
++  void OnMouseEntered(const ui::MouseEvent& event) override;
++  void OnMouseExited(const ui::MouseEvent& event) override;
+   views::View* GetDefaultFocusableChild() override;
+   gfx::Size GetMinimumSize() const override;
+   gfx::Size CalculatePreferredSize(
+@@ -156,6 +158,20 @@
+ 
+   void UpdateInteriorMargin();
+ 
++  // Configures overlay (Arc-style) mode: the strip always behaves as if
++  // uncollapsed, paints a drop shadow + rounded card, and its on-screen
++  // visibility is driven by `SetOverlayVisible()` with a slide animation.
++  void SetOverlayMode(bool overlay_mode);
++  bool IsOverlayMode() const { return overlay_mode_; }
++
++  // In overlay mode, slides the strip in (visible=true) or out (false).
++  // No-op outside overlay mode.
++  void SetOverlayVisible(bool visible);
++  bool IsOverlayVisible() const { return overlay_visible_; }
++
++  using OverlayPointerCallback = base::RepeatingCallback<void(bool entered)>;
++  void SetOverlayPointerCallback(OverlayPointerCallback callback);
++
+   TabDragTarget* GetTabDragTarget(const gfx::Point& point_in_screen);
+ 
+  private:
+@@ -248,6 +264,14 @@
+   // (GetCurrentValue() -> 1).
+   gfx::SlideAnimation resize_animation_;
+ 
++  // True when this view is being used as the Arc-style floating overlay. In
++  // this mode the tabstrip is always rendered in its uncollapsed form and its
++  // horizontal position is controlled via a layer transform animation.
++  bool overlay_mode_ = false;
++  bool overlay_visible_ = false;
++  gfx::SlideAnimation overlay_slide_animation_{this};
++  OverlayPointerCallback overlay_pointer_callback_;
++
+   // Used to track the time needed to create a new tab from the new tab button.
+   std::optional<base::TimeTicks> new_tab_button_pressed_start_time_;
+ };
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -17,6 +17,7 @@
+ #include "base/metrics/user_metrics.h"
+ #include "base/metrics/user_metrics_action.h"
+ #include "base/notimplemented.h"
++#include "base/numerics/safe_conversions.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+ #include "chrome/browser/ui/browser_actions.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+@@ -54,6 +55,7 @@
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_id.h"
+ #include "ui/compositor/layer.h"
++#include "ui/gfx/geometry/transform.h"
+ #include "ui/display/screen.h"
+ #include "ui/gfx/animation/animation.h"
+ #include "ui/gfx/geometry/point.h"
+@@ -186,6 +188,12 @@
+                                 : bounds().right() - resize_area_width_;
+   resize_area_->SetBoundsRect(
+       gfx::Rect(resize_area_x, 0, resize_area_width_, bounds().height()));
++
++  // In overlay mode, ensure the layer transform is in sync with the current
++  // animation progress whenever the layout (and thus our width) changes.
++  if (overlay_mode_ && layer()) {
++    AnimationProgressed(&overlay_slide_animation_);
++  }
+ }
+ 
+ views::View* VerticalTabStripRegionView::GetDefaultFocusableChild() {
+@@ -569,6 +577,25 @@
+ 
+ void VerticalTabStripRegionView::AnimationProgressed(
+     const gfx::Animation* animation) {
++  if (animation == &overlay_slide_animation_) {
++    // Animate horizontal offset via layer transform.
++    if (!layer()) {
++      return;
++    }
++    const double progress = overlay_slide_animation_.GetCurrentValue();
++    const int offscreen_dx =
++        state_controller_ && state_controller_->IsTabStripRightAligned()
++            ? width()
++            : -width();
++    const int current_dx =
++        base::ClampRound((1.0 - progress) * offscreen_dx);
++    gfx::Transform transform;
++    transform.Translate(current_dx, 0);
++    layer()->SetTransform(transform);
++    // Also fade in slightly to make the card feel like it's appearing.
++    layer()->SetOpacity(0.2f + 0.8f * static_cast<float>(progress));
++    return;
++  }
+   DCHECK_EQ(animation, &resize_animation_);
+   if (tab_strip_view_) {
+     tab_strip_view_->SetIsAnimatingSize(true);
+@@ -578,6 +605,12 @@
+ 
+ void VerticalTabStripRegionView::AnimationEnded(
+     const gfx::Animation* animation) {
++  if (animation == &overlay_slide_animation_) {
++    // Nothing to clean up: visibility in overlay mode is communicated via the
++    // layer transform / opacity. Keeping the view "visible" lets the layout
++    // engine continue to size it correctly.
++    return;
++  }
+   DCHECK_EQ(animation, &resize_animation_);
+   if (tab_strip_view_) {
+     tab_strip_view_->SetIsAnimatingSize(false);
+@@ -585,12 +618,81 @@
+ }
+ void VerticalTabStripRegionView::AnimationCanceled(
+     const gfx::Animation* animation) {
++  if (animation == &overlay_slide_animation_) {
++    return;
++  }
+   DCHECK_EQ(animation, &resize_animation_);
+   if (tab_strip_view_) {
+     tab_strip_view_->SetIsAnimatingSize(false);
+   }
+ }
+ 
++void VerticalTabStripRegionView::SetOverlayMode(bool overlay_mode) {
++  if (overlay_mode_ == overlay_mode) {
++    return;
++  }
++  overlay_mode_ = overlay_mode;
++
++  if (overlay_mode_) {
++    // Paint the overlay into its own layer so we can slide + drop-shadow it.
++    SetPaintToLayer();
++    layer()->SetFillsBoundsOpaquely(false);
++    overlay_slide_animation_.SetSlideDuration(base::Milliseconds(180));
++    overlay_slide_animation_.SetTweenType(gfx::Tween::Type::EASE_OUT);
++    // Force uncollapsed form: the floating overlay card is always rendered
++    // in its uncollapsed form. We update the controller so child views that
++    // read IsCollapsed() render correctly; the previous collapsed choice is
++    // naturally restored when the user switches back to docked Vertical mode
++    // because that pref write only happens during resize interactions.
++    if (state_controller_ && state_controller_->IsCollapsed()) {
++      state_controller_->SetCollapsed(false);
++    }
++    // Start hidden (off-screen) but keep the view itself visible so that
++    // the layout engine still sizes it.
++    overlay_visible_ = false;
++    overlay_slide_animation_.Reset(0.0);
++    AnimationProgressed(&overlay_slide_animation_);
++  } else {
++    DestroyLayer();
++    overlay_visible_ = true;
++  }
++  UpdateInteriorMargin();
++  InvalidateLayout();
++  SchedulePaint();
++}
++
++void VerticalTabStripRegionView::OnMouseEntered(const ui::MouseEvent& /*event*/) {
++  if (overlay_mode_ && overlay_pointer_callback_) {
++    overlay_pointer_callback_.Run(true);
++  }
++}
++
++void VerticalTabStripRegionView::OnMouseExited(const ui::MouseEvent& /*event*/) {
++  if (overlay_mode_ && overlay_pointer_callback_) {
++    overlay_pointer_callback_.Run(false);
++  }
++}
++
++void VerticalTabStripRegionView::SetOverlayPointerCallback(
++    OverlayPointerCallback callback) {
++  overlay_pointer_callback_ = std::move(callback);
++}
++
++void VerticalTabStripRegionView::SetOverlayVisible(bool visible) {
++  if (!overlay_mode_) {
++    return;
++  }
++  if (overlay_visible_ == visible) {
++    return;
++  }
++  overlay_visible_ = visible;
++  if (visible) {
++    overlay_slide_animation_.Show();
++  } else {
++    overlay_slide_animation_.Hide();
++  }
++}
++
+ bool VerticalTabStripRegionView::IsPositionInWindowCaption(
+     const gfx::Point& point) {
+   // Check the resize area first, it should always take precedence over other
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -606,9 +606,16 @@
+   const bool vertical_right_aligned =
+       delegate().IsVerticalTabStripRightAligned();
+   const bool zen_mode = delegate().IsZenModeEnabledForLayout();
++  const bool vertical_overlay_mode =
++      tab_strip_type == TabStripType::kVertical &&
++      delegate().IsVerticalTabStripOverlayMode();
+   const bool float_vertical_tab_strip =
+-      zen_mode && tab_strip_type == TabStripType::kVertical &&
+-      !delegate().IsZenModeSideChromePinned();
++      tab_strip_type == TabStripType::kVertical &&
++      ((zen_mode && !delegate().IsZenModeSideChromePinned()) ||
++       vertical_overlay_mode);
++  // Gap reserved on the leading/trailing edge of the webview for the hover
++  // hot-zone when Vertical Overlay layout is active.
++  constexpr int kVerticalOverlayGap = 10;
+   const float top_chrome_ratio = delegate().GetTopChromeRevealRatio();
+   const bool top_chrome_visible = top_chrome_ratio > 0.0f;
+   const float side_chrome_ratio = delegate().GetSideChromeRevealRatio();
+@@ -683,6 +690,10 @@
+       if (zen_mode) {
+         top_offset = ScaleExtent(top_offset, top_chrome_ratio);
+       }
++      // The Vertical Overlay card is always full-height.
++      if (vertical_overlay_mode) {
++        top_offset = 0;
++      }
+ 
+       vertical_tab_strip_bounds = gfx::Rect(
+           vertical_tab_strip_x, params.visual_client_area.y() + top_offset,
+@@ -694,6 +705,12 @@
+       if (!float_vertical_tab_strip) {
+         params.InsetHorizontal(vertical_tab_strip_width,
+                                /*leading=*/!vertical_right_aligned);
++      } else if (vertical_overlay_mode) {
++        // In Vertical Overlay layout the strip floats above the webview, but
++        // a small gap is reserved on the hover side for the hot-zone / visual
++        // breathing room.
++        params.InsetHorizontal(kVerticalOverlayGap,
++                               /*leading=*/!vertical_right_aligned);
+       }
+ 
+       // Let the vertical tab strip animate out over the content.
+@@ -712,6 +729,25 @@
+                         vertical_tab_strip_bounds.width() > 0);
+   }
+ 
++  // Position the vertical-overlay hover zone along the leading (or trailing)
++  // edge of the webview when the Vertical Overlay layout is active.
++  if (IsParentedTo(views().vertical_overlay_hover_zone,
++                   views().browser_view)) {
++    gfx::Rect hover_zone_bounds;
++    if (vertical_overlay_mode) {
++      const int zone_x =
++          vertical_right_aligned
++              ? browser_params.visual_client_area.right() - kVerticalOverlayGap
++              : browser_params.visual_client_area.x();
++      hover_zone_bounds =
++          gfx::Rect(zone_x, browser_params.visual_client_area.y(),
++                    kVerticalOverlayGap,
++                    browser_params.visual_client_area.height());
++    }
++    layout.AddChild(views().vertical_overlay_hover_zone, hover_zone_bounds,
++                    vertical_overlay_mode);
++  }
++
+   // TODO(crbug.com/469425263): Ensure correct layout calculations for the
+   // Project Panel Container.
+   if (IsParentedToAndVisible(views().projects_panel_container,
+@@ -806,8 +842,8 @@
+     // Ensure the floating VTS starts below the full top container.
+     // Pinned VTS doesn't need this - bookmarks are inset by VTS width
+     // and the VTS background covers the zen border strip.
+-    if (float_vertical_tab_strip && top_chrome_visible &&
+-        top_container_layout.bounds.height() > 0) {
++    if (float_vertical_tab_strip && !vertical_overlay_mode &&
++        top_chrome_visible && top_container_layout.bounds.height() > 0) {
+       auto it = layout.children.find(views().vertical_tab_strip_region_view);
+       if (it != layout.children.end()) {
+         const int tc_bottom = top_container_layout.bounds.bottom();
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout.h
+@@ -67,6 +67,7 @@
+   raw_ptr<HorizontalTabStripRegionView> horizontal_tab_strip_region_view =
+       nullptr;
+   raw_ptr<VerticalTabStripRegionView> vertical_tab_strip_region_view = nullptr;
++  raw_ptr<views::View> vertical_overlay_hover_zone = nullptr;
+   raw_ptr<ProjectsPanelView> projects_panel_container = nullptr;
+   raw_ptr<views::View> toolbar = nullptr;
+   raw_ptr<InfoBarContainerView> infobar_container = nullptr;
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
+@@ -32,6 +32,10 @@
+   virtual bool ShouldDrawToolbarTabStrip() const = 0;
+   virtual bool IsVerticalTabStripCollapsed() const = 0;
+   virtual bool IsVerticalTabStripRightAligned() const = 0;
++  // True when the active layout is the floating Vertical Overlay mode. In this
++  // mode the vertical tab strip is drawn as an overlay on top of contents
++  // rather than taking horizontal space from the web view.
++  virtual bool IsVerticalTabStripOverlayMode() const = 0;
+   virtual bool ShouldDrawWebAppFrameToolbar() const = 0;
+   virtual bool GetBorderlessModeEnabled() const = 0;
+   virtual BrowserLayoutParams GetBrowserLayoutParams(
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
+@@ -27,6 +27,7 @@
+   bool ShouldDrawToolbarTabStrip() const override;
+   bool IsVerticalTabStripCollapsed() const override;
+   bool IsVerticalTabStripRightAligned() const override;
++  bool IsVerticalTabStripOverlayMode() const override;
+   bool ShouldDrawWebAppFrameToolbar() const override;
+   bool GetBorderlessModeEnabled() const override;
+   BrowserLayoutParams GetBrowserLayoutParams(
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
+@@ -65,6 +65,12 @@
+   return controller && controller->IsTabStripRightAligned();
+ }
+ 
++bool BrowserViewLayoutDelegateImpl::IsVerticalTabStripOverlayMode() const {
++  auto* controller =
++      tabs::VerticalTabStripStateController::From(browser_view_->browser());
++  return controller && controller->IsOverlayMode();
++}
++
+ bool BrowserViewLayoutDelegateImpl::ShouldDrawWebAppFrameToolbar() const {
+   return browser_view_->ShouldDrawWebAppFrameToolbar();
+ }
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -301,6 +301,9 @@
+   <message name="IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL" desc="Vertical option in the browser layout dropdown.">
+     Vertical
+   </message>
++  <message name="IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL_OVERLAY" desc="Vertical overlay option in the browser layout dropdown. The vertical tab strip is hidden by default and slides out on hover.">
++    Vertical Overlay
++  </message>
+   <message name="IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN" desc="Label for the toggle that displays vertical tabs on the right side of the browser window.">
+     Show vertical tabs on right side
+   </message>
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -509,6 +509,8 @@
+       {"browserLayoutDynamic", IDS_SETTINGS_BROWSER_LAYOUT_DYNAMIC},
+       {"browserLayoutCompact", IDS_SETTINGS_BROWSER_LAYOUT_COMPACT},
+       {"browserLayoutVertical", IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL},
++      {"browserLayoutVerticalOverlay",
++       IDS_SETTINGS_BROWSER_LAYOUT_VERTICAL_OVERLAY},
+       {"tabStripRightAlign", IDS_SETTINGS_TAB_STRIP_RIGHT_ALIGN},
+       {"browserZenMode", IDS_SETTINGS_BROWSER_ZEN_MODE},
+       {"browserZenModeDescription", IDS_SETTINGS_BROWSER_ZEN_MODE_DESCRIPTION},
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.ts
+@@ -90,6 +90,7 @@
+   COMPACT = 1,
+   VERTICAL = 2,
+   DYNAMIC = 3,
++  VERTICAL_OVERLAY = 4,
+ }
+ 
+ const SettingsAppearancePageElementBase =
+@@ -240,6 +241,10 @@
+               value: BrowserLayout.VERTICAL,
+               name: loadTimeData.getString('browserLayoutVertical'),
+             },
++            {
++              value: BrowserLayout.VERTICAL_OVERLAY,
++              name: loadTimeData.getString('browserLayoutVerticalOverlay'),
++            },
+           ];
+         },
+       },
+@@ -483,7 +488,9 @@
+   // </if>
+ 
+   private showVerticalRightAlignSetting_(layout: number|undefined): boolean {
+-    return this.showVerticalTabsEnabled_ && layout === BrowserLayout.VERTICAL;
++    return this.showVerticalTabsEnabled_ &&
++        (layout === BrowserLayout.VERTICAL ||
++         layout === BrowserLayout.VERTICAL_OVERLAY);
+   }
+ 
+   private showCenteredLocationBarSetting_(layout: number|undefined): boolean {
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -4023,6 +4023,8 @@
+       "views/frame/top_container_view.cc",
+       "views/frame/top_container_view.h",
+       "views/frame/top_controls_slide_controller.h",
++      "views/frame/vertical_overlay_hover_zone.cc",
++      "views/frame/vertical_overlay_hover_zone.h",
+       "views/frame/vertical_tab_strip_region_view.cc",
+       "views/frame/vertical_tab_strip_region_view.h",
+       "views/frame/web_contents_close_handler.cc",
+--- /dev/null
++++ b/chrome/browser/ui/views/frame/vertical_overlay_hover_zone.h
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_FRAME_VERTICAL_OVERLAY_HOVER_ZONE_H_
++#define CHROME_BROWSER_UI_VIEWS_FRAME_VERTICAL_OVERLAY_HOVER_ZONE_H_
++
++#include "base/functional/callback.h"
++#include "base/timer/timer.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++// A thin, transparent hot-zone view placed along the leading (or trailing)
++// edge of the browser when the Vertical Overlay layout is active. Hovering
++// this zone reveals the floating vertical tab strip overlay; moving the
++// pointer away (with a short grace window) hides it again.
++class VerticalOverlayHoverZone : public views::View {
++  METADATA_HEADER(VerticalOverlayHoverZone, views::View)
++
++ public:
++  using VisibilityChangedCallback = base::RepeatingCallback<void(bool visible)>;
++
++  explicit VerticalOverlayHoverZone(VisibilityChangedCallback callback);
++  VerticalOverlayHoverZone(const VerticalOverlayHoverZone&) = delete;
++  VerticalOverlayHoverZone& operator=(const VerticalOverlayHoverZone&) = delete;
++  ~VerticalOverlayHoverZone() override;
++
++  // Used by the overlay strip itself: when the pointer enters/exits the
++  // overlay card, we keep it visible/schedule a dismiss the same way as the
++  // hover zone does.
++  void OnOverlayPointerEntered();
++  void OnOverlayPointerExited();
++
++  // views::View:
++  void OnMouseEntered(const ui::MouseEvent& event) override;
++  void OnMouseExited(const ui::MouseEvent& event) override;
++
++ private:
++  void Show();
++  void ScheduleHide();
++
++  VisibilityChangedCallback callback_;
++  bool visible_ = false;
++  base::OneShotTimer hide_timer_;
++};
++
++#endif  // CHROME_BROWSER_UI_VIEWS_FRAME_VERTICAL_OVERLAY_HOVER_ZONE_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/frame/vertical_overlay_hover_zone.cc
+@@ -0,0 +1,72 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/frame/vertical_overlay_hover_zone.h"
++
++#include <utility>
++
++#include "base/time/time.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++
++namespace {
++// Grace period before dismissing the overlay after the pointer leaves both
++// the hover zone and the overlay strip. Arc uses a similar delay to avoid
++// accidental dismissals when the user briefly overshoots.
++constexpr base::TimeDelta kHideDelay = base::Milliseconds(250);
++}  // namespace
++
++VerticalOverlayHoverZone::VerticalOverlayHoverZone(
++    VisibilityChangedCallback callback)
++    : callback_(std::move(callback)) {
++  // The hover zone is transparent and doesn't intercept clicks; it only
++  // reports mouse-enter/exit events.
++  SetCanProcessEventsWithinSubtree(true);
++  SetNotifyEnterExitOnChild(true);
++}
++
++VerticalOverlayHoverZone::~VerticalOverlayHoverZone() = default;
++
++void VerticalOverlayHoverZone::OnMouseEntered(const ui::MouseEvent& /*event*/) {
++  Show();
++}
++
++void VerticalOverlayHoverZone::OnMouseExited(const ui::MouseEvent& /*event*/) {
++  ScheduleHide();
++}
++
++void VerticalOverlayHoverZone::OnOverlayPointerEntered() {
++  Show();
++}
++
++void VerticalOverlayHoverZone::OnOverlayPointerExited() {
++  ScheduleHide();
++}
++
++void VerticalOverlayHoverZone::Show() {
++  hide_timer_.Stop();
++  if (visible_) {
++    return;
++  }
++  visible_ = true;
++  if (callback_) {
++    callback_.Run(true);
++  }
++}
++
++void VerticalOverlayHoverZone::ScheduleHide() {
++  hide_timer_.Start(FROM_HERE, kHideDelay, base::BindOnce(
++                                                [](VerticalOverlayHoverZone* self) {
++                                                  if (!self->visible_) {
++                                                    return;
++                                                  }
++                                                  self->visible_ = false;
++                                                  if (self->callback_) {
++                                                    self->callback_.Run(false);
++                                                  }
++                                                },
++                                                base::Unretained(this)));
++}
++
++BEGIN_METADATA(VerticalOverlayHoverZone)
++END_METADATA
